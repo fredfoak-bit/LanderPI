@@ -94,7 +94,7 @@ class GreenLineFollowingNode(Node):
             if self.lidar_sub is None:
                 qos = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT)
                 self.lidar_sub = self.create_subscription(LaserScan, '/scan_raw', self.lidar_callback, qos)
-                set_servo_position(self.joints_pub, 1, ((10, 200), (5, 500), (4, 90), (3, 150), (2, 645), (1, 500)))
+                set_servo_position(self.joints_pub, 1, ((10, 200), (5, 500), (4, 90), (3, 150), (2, 770), (1, 500))) # Pitched robot arm up to see green beacon
             self.mecanum_pub.publish(Twist())
         response.success = True
         response.message = "enter"
