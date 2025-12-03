@@ -123,6 +123,8 @@ class GreenLineFollowingNode(Node):
         self.searching_for_green = True
         # Allow tuning how fast the robot spins while searching.
         self.search_angular_speed = float(self.declare_parameter('search_angular_speed', 0.2).value)
+        # Whether to spin in place while searching (vs. slow turning).
+        self.search_spin_in_place = bool(self.declare_parameter('search_spin_in_place', True).value)
         self.threshold = 0.5
         # Stop only when obstacles are very close; configurable via parameter.
         self.stop_threshold = float(self.declare_parameter('stop_threshold', 0.15).value)
@@ -362,7 +364,10 @@ class GreenLineFollowingNode(Node):
                     twist.angular.z = common.set_range(-self.pid.output, -1.0, 1.0)
                 self.mecanum_pub.publish(twist)
             elif self.is_running and self.searching_for_green and not self.stop:
-                twist.linear.x = 0.0
+                # Force spin-in-place while searching so the robot doesn't creep forward.
+                if self.search_spin_in_place:
+                    twist.linear.x = 0.0
+                    twist.linear.y = 0.0
                 twist.angular.z = self.search_angular_speed
                 self.mecanum_pub.publish(twist)
             elif self.stop:
