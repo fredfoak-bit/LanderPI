@@ -20,8 +20,8 @@ def generate_launch_description():
     )
 
     green_nav_node = Node(
-        package='landerpi',          # update to your package name
-        executable='green_nav',      # console_script entry point -> green_nav:main
+        package='green_nav_pkg',         
+        executable='green_nav',     
         name='green_nav',
         output='screen',
         parameters=[{'debug': False}],
