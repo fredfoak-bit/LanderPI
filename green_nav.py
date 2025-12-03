@@ -161,6 +161,7 @@ class GreenLineFollowingNode(Node):
         self.create_service(SetFloat64, '~/set_threshold', self.set_threshold_srv_callback)
         self.joints_pub = self.create_publisher(ServosPosition, 'servo_controller', 1)
         self.create_timer(5.0, self._image_watchdog)
+        self.create_timer(2.0, self._search_status_tick)
 
         Heart(self, self.name + '/heartbeat', 5, lambda _: self.exit_srv_callback(request=Trigger.Request(), response=Trigger.Response()))
         self.debug = bool(self.get_parameter('debug').value)
@@ -189,6 +190,13 @@ class GreenLineFollowingNode(Node):
             self.log_debug("Waiting for first image on topic: " + self.image_topic + " (override with parameter image_topic)")
         elif now - self.last_image_ts > 5.0:
             self.log_debug(f"No images received for {now - self.last_image_ts:.1f}s on {self.image_topic} (override with parameter image_topic)")
+
+    def _search_status_tick(self):
+        if not self.debug:
+            return
+        with self.lock:
+            if self.is_running and self.searching_for_green and not self.stop:
+                self.log_debug(f"Searching for green… angular z={self.search_angular_speed}")
 
     def pwm_controller(self, position_data):
         pwm_list = []
