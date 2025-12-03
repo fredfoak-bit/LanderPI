@@ -121,7 +121,8 @@ class GreenLineFollowingNode(Node):
         self.count = 0
         self.stop = False
         self.searching_for_green = True
-        self.search_angular_speed = 0.4
+        # Allow tuning how fast the robot spins while searching.
+        self.search_angular_speed = float(self.declare_parameter('search_angular_speed', 0.2).value)
         self.threshold = 0.5
         # Stop only when obstacles are very close; configurable via parameter.
         self.stop_threshold = float(self.declare_parameter('stop_threshold', 0.15).value)
