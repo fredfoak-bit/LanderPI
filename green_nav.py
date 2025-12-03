@@ -135,7 +135,8 @@ class GreenLineFollowingNode(Node):
         self.lab_data = common.get_yaml_data("/home/ubuntu/software/lab_tool/lab_config.yaml")
         self.camera_type = os.environ['DEPTH_CAMERA_TYPE']
         self.last_image_ts = None
-        self.image_topic = self._resolve_image_topic()
+        default_image_topic = self._resolve_image_topic()
+        self.image_topic = self.declare_parameter('image_topic', default_image_topic).value
         self.lidar_type = os.environ.get('LIDAR_TYPE')
         self.machine_type = os.environ.get('MACHINE_TYPE')
         self.pwm_pub = self.create_publisher(SetPWMServoState, 'ros_robot_controller/pwm_servo/set_state', 10)
@@ -160,19 +161,19 @@ class GreenLineFollowingNode(Node):
 
     def _resolve_image_topic(self) -> str:
         if self.camera_type == 'aurora':
-            return 'aurora/camera_publisher/rgb0/image'
+            return '/aurora/camera_publisher/rgb0/image'
         if self.camera_type == 'usb_cam':
-            return 'camera/image'
-        return 'ascamera/camera_publisher/rgb0/image'
+            return '/camera/image'
+        return '/ascamera/camera_publisher/rgb0/image'
 
     def _image_watchdog(self):
         if not self.debug:
             return
         now = time.time()
         if self.last_image_ts is None:
-            self.log_debug("Waiting for first image on topic: " + self.image_topic)
+            self.log_debug("Waiting for first image on topic: " + self.image_topic + " (override with parameter image_topic)")
         elif now - self.last_image_ts > 5.0:
-            self.log_debug(f"No images received for {now - self.last_image_ts:.1f}s on {self.image_topic}")
+            self.log_debug(f"No images received for {now - self.last_image_ts:.1f}s on {self.image_topic} (override with parameter image_topic)")
 
     def pwm_controller(self, position_data):
         pwm_list = []
