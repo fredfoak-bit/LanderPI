@@ -1,402 +1,623 @@
 #!/usr/bin/env python3
 # encoding: utf-8
+# Line following (green) + LiDAR obstacle avoidance
 
 import os
-import math
-import threading
-import time
 import cv2
-import numpy as np
+import math
+import time
 import rclpy
+import queue
+import threading
+import numpy as np
+
 import sdk.pid as pid
 import sdk.common as common
+
 from rclpy.node import Node
-from rclpy.parameter import Parameter
-from geometry_msgs.msg import Twist
-from std_srvs.srv import SetBool, Trigger
-from sensor_msgs.msg import Image, LaserScan
-from interfaces.srv import SetFloat64
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
-from ros_robot_controller_msgs.msg import SetPWMServoState, PWMServoState
-from servo_controller_msgs.msg import ServosPosition
-from servo_controller.bus_servo_control import set_servo_position
+
+from app.common import Heart, ColorPicker
 from cv_bridge import CvBridge
-from app.common import Heart
+
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Image, LaserScan, PointCloud2
+from std_msgs.msg import String
+from std_srvs.srv import Trigger, SetBool
+
+if os.environ['DEPTH_CAMERA_TYPE'] == 'aurora':
+    from depth_camera_aurora.decoder import decode_image
 
 
-MAX_SCAN_ANGLE = 240  # degree (lidar scanning angle used for obstacle checks)
+lock = threading.RLock()
 
 
-class LineFollower:
-    """Minimal in-package copy of the line follower used by green_nav."""
-
-    def __init__(self, color, node):
+class LineFollower(object):
+    def __init__(self, target_color, node):
         self.node = node
-        self.target_lab, self.target_rgb = color
+        self.target_lab, self.rois = target_color[0], None
+        self.deflection_angle = None
         self.depth_camera_type = os.environ['DEPTH_CAMERA_TYPE']
-        if self.depth_camera_type == 'ascamera':
-            self.rois = ((0.9, 0.95, 0, 1, 0.7), (0.8, 0.85, 0, 1, 0.2), (0.7, 0.75, 0, 1, 0.1))
-        elif self.depth_camera_type == 'aurora':  # Aurora camera defaults
-            self.rois = ((0.81, 0.83, 0, 1, 0.7), (0.69, 0.71, 0, 1, 0.2), (0.57, 0.59, 0, 1, 0.1))
-        elif self.depth_camera_type == 'usb_cam':
-            self.rois = ((0.79, 0.81, 0, 1, 0.7), (0.67, 0.69, 0, 1, 0.2), (0.55, 0.57, 0, 1, 0.1))
-        else:
-            self.rois = ((0.8, 0.85, 0, 1, 0.7), (0.7, 0.75, 0, 1, 0.2), (0.6, 0.65, 0, 1, 0.1))
+        self.camera_type = os.environ['CAMERA_TYPE']
 
-        self.weight_sum = 1.0
+        # --- ROIs for different cameras ---
+        if self.camera_type == 'Stereo':
+            self.rois = (
+                (0.70, 0.75, 0.4, 0.7, 0.7),
+                (0.55, 0.60, 0.4, 0.7, 0.2),
+                (0.40, 0.45, 0.4, 0.7, 0.1),
+            )
+        elif self.camera_type in ('Webcam_Stream', 'Realsense', 'Oak-D Pro W'):
+            self.rois = (
+                (0.8, 0.85, 0.1, 0.6, 0.7),
+                (0.6, 0.65, 0.1, 0.55, 0.1),
+                (0.4, 0.45, 0.1, 0.5, 0.1),
+                (0.2, 0.25, 0.1, 0.45, 0.1),
+            )
+        elif self.depth_camera_type == 'ascamera':
+            self.rois = (
+                (0.9, 0.95, 0, 1, 0.7),
+                (0.8, 0.85, 0, 1, 0.2),
+                (0.7, 0.75, 0, 1, 0.1),
+            )
+        elif self.depth_camera_type == 'aurora':
+            # original aurora ROIs; you can tweak if needed
+            self.rois = (
+                (0.81, 0.83, 0, 1, 0.7),
+                (0.69, 0.71, 0, 1, 0.2),
+                (0.57, 0.59, 0, 1, 0.1),
+            )
 
-    @staticmethod
-    def get_area_max_contour(contours, threshold=100):
-        contour_area = zip(contours, tuple(map(lambda c: math.fabs(cv2.contourArea(c)), contours)))
-        contour_area = tuple(filter(lambda c_a: c_a[1] > threshold, contour_area))
-        if len(contour_area) > 0:
-            max_c_a = max(contour_area, key=lambda c_a: c_a[1])
-            return max_c_a
-        return None
+        if isinstance(target_color[1], list):
+            self.target_lab = target_color[0]
+            self.lowerb = target_color[1]
+            self.upperb = target_color[2]
 
-    def __call__(self, image, result_image, threshold, color=None, use_color_picker=True):
-        centroid_sum = 0
-        h, w = image.shape[:2]
-        if os.environ['DEPTH_CAMERA_TYPE'] == 'ascamera':
-            w = w + 200
+    def get_area_max_contour(self, contours):
+        area_max_contour, area_max = None, 0
+        for c in contours:
+            area = abs(cv2.contourArea(c))
+            if area > area_max:
+                area_max = area
+                area_max_contour = c
+        return area_max_contour, area_max
+
+    def get_contour(self, binary, result_image, roi, x_bias=0, y_bias=0):
+        image, contours, _ = common.get_objs_contours(binary)
+        center_x = None
+        if len(contours) > 0:
+            area = max(contours, key=cv2.contourArea)
+            theta = common.get_angle(area, image)
+            if abs(theta) not in [90.0, 0.0] and abs(theta) < 50.0:
+                (center_x, center_y), radius = cv2.minEnclosingCircle(area)
+                center_x, center_y, radius = int(center_x), int(center_y), int(radius)
+
+                cv2.circle(result_image, (center_x + x_bias, center_y + y_bias), radius, (0, 0, 255), 2)
+                cv2.circle(result_image, (center_x + x_bias, center_y + y_bias), 5, (0, 0, 255), -1)
+                cv2.drawContours(result_image, contours, -1, (255, 0, 0), 2)
+
+                cv2.rectangle(
+                    result_image,
+                    (int(roi[2] * self.node.image_width) + x_bias, int(roi[0] * self.node.image_height) + y_bias),
+                    (int(roi[3] * self.node.image_width) + x_bias, int(roi[1] * self.node.image_height) + y_bias),
+                    (34, 139, 34),
+                    2,
+                )
+        return result_image, center_x
+
+    def __call__(self, image, result_image, threshold, color=None, use_color_picker=False):
+        image_height, image_width = image.shape[:2]
+        if self.target_lab is None:
+            if color is None:
+                return result_image, None
+            else:
+                self.target_lab = color
+        if threshold < 0.1:
+            threshold = 0.1
+        threshold = min(threshold, 1.0)
+
         if use_color_picker:
-            min_color = [int(self.target_lab[0] - 50 * threshold * 2),
-                         int(self.target_lab[1] - 50 * threshold),
-                         int(self.target_lab[2] - 50 * threshold)]
-            max_color = [int(self.target_lab[0] + 50 * threshold * 2),
-                         int(self.target_lab[1] + 50 * threshold),
-                         int(self.target_lab[2] + 50 * threshold)]
-            target_color = self.target_lab, min_color, max_color
-            lowerb = tuple(target_color[1])
-            upperb = tuple(target_color[2])
+            self.target_l_lab = [
+                int(self.target_lab[0] - 20 * threshold),
+                int(self.target_lab[1] - 20 * threshold),
+                int(self.target_lab[2] - 20 * threshold),
+            ]
+            self.target_h_lab = [
+                int(self.target_lab[0] + 20 * threshold),
+                int(self.target_lab[1] + 20 * threshold),
+                int(self.target_lab[2] + 20 * threshold),
+            ]
+            min_color = self.target_l_lab
+            max_color = self.target_h_lab
+            lowerb = tuple(self.target_l_lab)
+            upperb = tuple(self.target_h_lab)
+        else:
+            min_color = [
+                int(self.target_lab[0] - 50 * threshold * 2),
+                int(self.target_lab[1] - 50 * threshold),
+                int(self.target_lab[2] - 50 * threshold),
+            ]
+            max_color = [
+                int(self.target_lab[0] + 50 * threshold * 2),
+                int(self.target_lab[1] + 50 * threshold),
+                int(self.target_lab[2] + 50 * threshold),
+            ]
+            if color is not None:
+                min_color = color['min']
+                max_color = color['max']
+
+        min_color = np.clip(min_color, 0, 255)
+        max_color = np.clip(max_color, 0, 255)
+        color_dist = math.sqrt(
+            (max_color[0] - min_color[0]) ** 2
+            + (max_color[1] - min_color[1]) ** 2
+            + (max_color[2] - min_color[2]) ** 2
+        )
+        threshold = common.set_range(color_dist, 0, 200, 0.1, 1.0)
+
+        if hasattr(self, 'target_l_lab'):
+            min_color = self.target_l_lab
+            max_color = self.target_h_lab
+        target_color = [self.target_lab, min_color, max_color]
+
+        if hasattr(self, 'lowerb') and hasattr(self, 'upperb'):
+            lowerb = tuple(self.lowerb)
+            upperb = tuple(self.upperb)
         else:
             lowerb = tuple(color['min'])
             upperb = tuple(color['max'])
+
         for roi in self.rois:
-            blob = image[int(roi[0]*h):int(roi[1]*h), int(roi[2]*w):int(roi[3]*w)]
+            blob = image[
+                int(roi[0] * image_height) : int(roi[1] * image_height),
+                int(roi[2] * image_width) : int(roi[3] * image_width),
+            ]
             img_lab = cv2.cvtColor(blob, cv2.COLOR_RGB2LAB)
             img_blur = cv2.GaussianBlur(img_lab, (3, 3), 3)
             mask = cv2.inRange(img_blur, lowerb, upperb)
             eroded = cv2.erode(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
             dilated = cv2.dilate(eroded, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
             contours = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_L1)[-2]
-            max_contour_area = self.get_area_max_contour(contours, 30)
-            if max_contour_area is not None:
-                rect = cv2.minAreaRect(max_contour_area[0])
-                box = np.intp(cv2.boxPoints(rect))
-                for j in range(4):
-                    box[j, 1] = box[j, 1] + int(roi[0]*h)
-                cv2.drawContours(result_image, [box], -1, (0, 255, 255), 2)
+            blob_area_max_contour, blob_area_max = self.get_area_max_contour(contours)
+            if blob_area_max > 50:
+                result_image, center_x = self.get_contour(
+                    dilated, result_image, roi, int(roi[2] * image_width), int(roi[0] * image_height)
+                )
+                if center_x is not None:
+                    self.deflection_angle = common.get_deflection_angle(
+                        image_width / 2,
+                        center_x + int(roi[2] * image_width),
+                        int(roi[1] * image_height),
+                        int(roi[0] * image_height),
+                    )
+                    cv2.putText(
+                        result_image,
+                        'Angle: ' + str(int(self.deflection_angle / math.pi * 180)) + ' deg',
+                        (10, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        [0, 0, 255],
+                    )
+        return result_image, self.deflection_angle
 
-                pt1_x, pt1_y = box[0, 0], box[0, 1]
-                pt3_x, pt3_y = box[2, 0], box[2, 1]
-                line_center_x, line_center_y = (pt1_x + pt3_x) / 2, (pt1_y + pt3_y) / 2
 
-                cv2.circle(result_image, (int(line_center_x), int(line_center_y)), 5, (0, 0, 255), -1)
-                centroid_sum += line_center_x * roi[-1]
-        if centroid_sum == 0:
-            return result_image, None
-        center_pos = centroid_sum / self.weight_sum
-        deflection_angle = -math.atan((center_pos - (w / 2.0)) / (h / 2.0))
-        return result_image, deflection_angle
-
-
-class GreenLineFollowingNode(Node):
-    #Line follower locked to a green target; color picker is disabled."
-
-    def __init__(self, name: str):
-        rclpy.init()
-        super().__init__(name, allow_undeclared_parameters=True, automatically_declare_parameters_from_overrides=True)
+class LineFollowingWithLidarNode(Node):
+    def __init__(self, name):
+        super().__init__(name, automatically_declare_parameters_from_overrides=True)
 
         self.name = name
-        self.color = "green"
-        self.frame_count = 0
-        self.log_interval = 15
+
+        # --- line following state ---
+        self.color = 'green'                # follow green line by default
         self.set_callback = False
         self.is_running = False
+        self.color_picker = None
         self.follower = None
-        self.scan_angle = math.radians(45)
-        self.pid = pid.PID(0.030, 0.003, 0.0)
+        self.pid = pid.PID(0.005, 0.001, 0.0)
+
         self.empty = 0
         self.count = 0
-        self.stop = False
-        self.searching_for_green = True
-        self.search_angular_speed = 0.4
+        self.stop = False                   # used by depth cam stop
         self.threshold = 0.5
-        # Stop only when obstacles are very close; configurable via parameter.
-        self.stop_threshold = float(self.declare_parameter('stop_threshold', 0.15).value)
+        self.stop_threshold = 0.4
+
         self.lock = threading.RLock()
-        self.image_sub = None
-        self.lidar_sub = None
         self.image_height = None
         self.image_width = None
         self.bridge = CvBridge()
-        self.window_name = "green_nav"
-        self.window_initialized = False
-        self.use_color_picker = False  # lock to green
+        self.use_color_picker = False       # we use named color "green" by default
+
         self.lab_data = common.get_yaml_data("/home/ubuntu/software/lab_tool/lab_config.yaml")
-        self.camera_type = os.environ['DEPTH_CAMERA_TYPE']
-        lab_map = self.lab_data.get('lab', {})
-        self.lab_lookup_type = self.camera_type if self.camera_type in lab_map else 'ascamera'
-        self.last_image_ts = None
-        default_image_topic = self._resolve_image_topic()
-        # Handle auto-declared params (automatically_declare_parameters_from_overrides=True) without double-declare crashes.
-        image_topic_param = self.get_parameter('image_topic')
-        if image_topic_param.type_ == Parameter.Type.NOT_SET or image_topic_param.value is None:
-            try:
-                self.declare_parameter('image_topic', default_image_topic)
-            except Exception:
-                pass
-            self.image_topic = default_image_topic
-        else:
-            self.image_topic = image_topic_param.value
-        self.lidar_type = os.environ.get('LIDAR_TYPE')
-        self.machine_type = os.environ.get('MACHINE_TYPE')
-        self.pwm_pub = self.create_publisher(SetPWMServoState, 'ros_robot_controller/pwm_servo/set_state', 10)
-        self.mecanum_pub = self.create_publisher(Twist, '/controller/cmd_vel', 1)
-        self.result_publisher = self.create_publisher(Image, '~/image_result', 1)
-        self.create_service(Trigger, '~/enter', self.enter_srv_callback)
-        self.create_service(Trigger, '~/exit', self.exit_srv_callback)
-        self.create_service(SetBool, '~/set_running', self.set_running_srv_callback)
-        self.create_service(SetFloat64, '~/set_threshold', self.set_threshold_srv_callback)
-        self.joints_pub = self.create_publisher(ServosPosition, 'servo_controller', 1)
-        self.create_timer(5.0, self._image_watchdog)
-        self.create_timer(2.0, self._search_status_tick)
+        self.image_queue = queue.Queue(2)
+        self.camera_type = os.environ['CAMERA_TYPE']
+        self.depth_camera_type = os.environ['DEPTH_CAMERA_TYPE']
+        self.machine_type = os.environ['MACHINE_TYPE']
+        self.wait_cv = threading.Condition(threading.Lock())
+        self.result_image = None
+        self.common = None
 
-        Heart(self, self.name + '/heartbeat', 5, lambda _: self.exit_srv_callback(request=Trigger.Request(), response=Trigger.Response()))
-        self.debug = bool(self.get_parameter('debug').value)
-        self.log_debug(f"Debug logging enabled. DEPTH_CAMERA_TYPE={self.camera_type}, using LAB key={self.lab_lookup_type}, LIDAR_TYPE={self.lidar_type}, MACHINE_TYPE={self.machine_type}")
-        self.log_debug(f"Stop threshold set to {self.stop_threshold} meters (adjust with parameter stop_threshold)")
-        self.get_logger().info('\033[1;32m%s\033[0m' % 'green_nav start')
+        # --- LiDAR obstacle avoidance state (from lidar_controller) ---
+        self.obs_threshold = 0.6           # meters
+        self.obs_scan_angle = math.radians(90)
+        self.obs_speed = 0.2
+        self.obs_last_act = 0
+        self.obs_timestamp = 0.0
+        self.lidar_type = os.environ.get('LIDAR_TYPE', '')
+        self.avoid_twist = Twist()
+        self.avoid_active_until = 0.0      # time until which avoidance overrides line following
 
-    def log_debug(self, message: str):
-        if self.debug:
-            # rclpy logger already prints to terminal; keep messages concise.
-            self.get_logger().info(f"[debug] {message}")
+        # --- ROS entities ---
+        self.heart = Heart(self)
+        self.mecanum_pub = self.create_publisher(Twist, '/cmd_vel', 10)
 
-    def _resolve_image_topic(self) -> str:
-        if self.camera_type == 'aurora':
-            # On this platform Aurora images are published under ascamera namespace
-            return '/ascamera/camera_publisher/rgb0/image'
-        if self.camera_type == 'usb_cam':
-            return '/camera/image'
-        return '/ascamera/camera_publisher/rgb0/image'
+        self.image_sub = self.create_subscription(Image, '/image_raw', self.image_callback, 10)
 
-    def _image_watchdog(self):
-        if not self.debug:
-            return
-        now = time.time()
-        if self.last_image_ts is None:
-            self.log_debug("Waiting for first image on topic: " + self.image_topic + " (override with parameter image_topic)")
-        elif now - self.last_image_ts > 5.0:
-            self.log_debug(f"No images received for {now - self.last_image_ts:.1f}s on {self.image_topic} (override with parameter image_topic)")
+        if self.depth_camera_type == 'ascamera':
+            self.depth_subscriber = self.create_subscription(
+                PointCloud2, '/oakd/depth/image_raw', self.depth_camera_callback, 10
+            )
+        elif self.depth_camera_type == 'aurora':
+            self.depth_subscriber = self.create_subscription(
+                Image, '/aurora/depth/image_raw', self.depth_camera_callback, 10
+            )
 
-    def _search_status_tick(self):
-        if not self.debug:
-            return
+        # LiDAR subscription with QoS like lidar_controller
+        qos = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT)
+        self.lidar_sub = self.create_subscription(LaserScan, '/scan_raw', self.lidar_callback, qos)
+
+        # Services
+        self.enter_server = self.create_service(Trigger, f'/{name}/enter', self.enter_srv_callback)
+        self.exit_server = self.create_service(Trigger, f'/{name}/exit', self.exit_srv_callback)
+        self.set_running_server = self.create_service(SetBool, f'/{name}/set_running', self.set_srv_callback)
+        self.set_color_server = self.create_service(String, f'/{name}/set_color', self.set_color_srv_callback)
+        self.set_threshold_server = self.create_service(String, f'/{name}/set_threshold', self.set_threshold_srv_callback)
+        self.set_target_color_server = self.create_service(
+            Trigger, f'/{name}/set_target_color', self.set_target_color_srv_callback
+        )
+
+    # ---------- Simple service callbacks ----------
+
+    def set_threshold_srv_callback(self, request, response):
+        data = eval(request.data)
+        if 'threshold' in data:
+            with self.lock:
+                self.threshold = data['threshold']
+        if 'stop_threshold' in data:
+            with self.lock:
+                self.stop_threshold = data['stop_threshold']
+        response.success = True
+        return response
+
+    def set_color_srv_callback(self, request, response):
         with self.lock:
-            if self.is_running and self.searching_for_green and not self.stop:
-                self.log_debug(f"Searching for green… angular z={self.search_angular_speed}")
+            self.color = request.data
+            self.get_logger().info(f"Color set to: {self.color}")
+        response.success = True
+        return response
 
-    def pwm_controller(self, position_data):
-        pwm_list = []
-        msg = SetPWMServoState()
-        msg.duration = 0.2
-        for i in range(len(position_data)):
-            pos = PWMServoState()
-            pos.id = [i + 1]
-            pos.position = [int(position_data[i])]
-            pwm_list.append(pos)
-        msg.state = pwm_list
-        self.pwm_pub.publish(msg)
+    def set_target_color_srv_callback(self, request, response):
+        if self.color_picker is None:
+            self.color_picker = ColorPicker()
+        else:
+            self.color_picker = None
+        response.success = True
+        return response
+
+    # ---------- LiDAR-based obstacle avoidance (simplified from lidar_controller) ----------
+
+    def lidar_callback(self, lidar_data: LaserScan):
+        """
+        Use LiDAR to generate an avoidance twist for a short time window.
+        Logic adapted from running_mode == 1 in lidar_controller.py (non-Acker case).
+        """
+        twist = Twist()
+
+        # Choose left/right slices according to lidar type
+        if self.lidar_type != 'G4':
+            # MAX_SCAN_ANGLE logic from lidar_controller
+            if 'Pro' in os.environ.get('MACHINE_TYPE', ''):
+                max_scan_angle_deg = 120
+            else:
+                max_scan_angle_deg = 240
+            max_index = int(math.radians(max_scan_angle_deg / 2.0) / lidar_data.angle_increment)
+            left_ranges = lidar_data.ranges[:max_index]
+            right_ranges = lidar_data.ranges[::-1][:max_index]
+        else:
+            if 'Pro' in os.environ.get('MACHINE_TYPE', ''):
+                max_scan_angle_deg = 120
+            else:
+                max_scan_angle_deg = 240
+            min_index = int(
+                math.radians((360 - max_scan_angle_deg) / 2.0) / lidar_data.angle_increment
+            )
+            max_index = min_index + int(
+                math.radians(max_scan_angle_deg / 2.0) / lidar_data.angle_increment
+            )
+            left_ranges = lidar_data.ranges[::-1][min_index:max_index][::-1]
+            right_ranges = lidar_data.ranges[min_index:max_index][::-1]
+
+        with self.lock:
+            # Only act when previous avoidance has finished
+            if time.time() < self.obs_timestamp:
+                return
+
+            angle = self.obs_scan_angle / 2
+            angle_index = int(angle / lidar_data.angle_increment + 0.5)
+            left_range = np.array(left_ranges[:angle_index])
+            right_range = np.array(right_ranges[:angle_index])
+
+            # Only use non-zero finite values
+            left_nonzero = left_range.nonzero()
+            right_nonzero = right_range.nonzero()
+            left_nonan = np.isfinite(left_range[left_nonzero])
+            right_nonan = np.isfinite(right_range[right_nonzero])
+
+            min_dist_left_ = left_range[left_nonzero][left_nonan]
+            min_dist_right_ = right_range[right_nonzero][right_nonan]
+
+            if len(min_dist_left_) <= 1 or len(min_dist_right_) <= 1:
+                return
+
+            min_dist_left = min_dist_left_.min()
+            min_dist_right = min_dist_right_.min()
+
+            # Same branching logic as lidar_controller (non-Acker, running_mode==1),
+            # but instead of publishing here, we store twist & a time window.
+            if min_dist_left <= self.obs_threshold and min_dist_right > self.obs_threshold:
+                # obstacle on left -> turn right
+                twist.linear.x = self.obs_speed / 6.0
+                max_angle = math.radians(90)
+                w = self.obs_speed * 6.0
+                twist.angular.z = -w
+                if self.obs_last_act != 0 and self.obs_last_act != 1:
+                    twist.angular.z = w
+                self.obs_last_act = 1
+                duration = max_angle / w / 2.0
+
+            elif min_dist_left <= self.obs_threshold and min_dist_right <= self.obs_threshold:
+                # obstacles on both sides -> turn around
+                twist.linear.x = self.obs_speed / 6.0
+                w = self.obs_speed * 6.0
+                twist.angular.z = w
+                self.obs_last_act = 3
+                duration = math.radians(180) / w / 2.0
+
+            elif min_dist_left > self.obs_threshold and min_dist_right <= self.obs_threshold:
+                # obstacle on right -> turn left
+                twist.linear.x = self.obs_speed / 6.0
+                max_angle = math.radians(90)
+                w = self.obs_speed * 6.0
+                twist.angular.z = w
+                if self.obs_last_act != 0 and self.obs_last_act != 2:
+                    twist.angular.z = -w
+                self.obs_last_act = 2
+                duration = max_angle / w / 2.0
+
+            else:
+                # No obstacle nearby -> no special avoidance; let line-following run
+                self.obs_last_act = 0
+                return
+
+            # Set avoidance twist + time window
+            self.avoid_twist = twist
+            self.avoid_active_until = time.time() + duration
+            self.obs_timestamp = self.avoid_active_until
+
+    # ---------- Depth camera obstacle stop (existing behaviour) ----------
+
+    def depth_camera_callback(self, image):
+        if self.depth_camera_type == 'ascamera':
+            img = self.bridge.imgmsg_to_cv2(image, '32FC1')
+            img = common.convert_ascamera_depth_16bit(image, img)
+        elif self.depth_camera_type == 'aurora':
+            img = self.bridge.imgmsg_to_cv2(image, 'mono16')
+            img = decode_image(img)
+
+        with self.lock:
+            if self.image_height is None or self.image_width is None:
+                return
+            exterior_corners = [
+                (360, 0),
+                (518, 0),
+                (self.image_width, 240),
+                (self.image_width, 374),
+                (0, self.image_height),
+            ]
+            mask_image = np.zeros((self.image_height, self.image_width, 1), dtype="uint8")
+            cv2.fillPoly(mask_image, [np.array(exterior_corners)], (255,))
+            avg_depth_value = np.average(np.multiply(img, mask_image) / 255)
+
+            if avg_depth_value < 0.6:
+                self.stop = True
+                twist = Twist()
+                self.mecanum_pub.publish(twist)
+            else:
+                self.stop = False
+
+    # ---------- Enter / Exit / Running services ----------
 
     def enter_srv_callback(self, request, response):
-        self.get_logger().info('\033[1;32m%s\033[0m' % "green_nav enter")
-        if os.environ['DEPTH_CAMERA_TYPE'] != 'ascamera':
-            self.pwm_controller([1850, 1500])
-        with self.lock:
-            self.stop = False
-            self.is_running = False
-            self.searching_for_green = True
-            self.pid = pid.PID(1.1, 0.0, 0.0)
-            self.follower = LineFollower([None, common.range_rgb[self.color]], self)
-            self.threshold = 0.5
-            self.empty = 0
-            self.log_debug("Entering green_nav: reset PID and thresholds; creating subscriptions if needed.")
-            if self.image_sub is None:
-                image_qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
-                self.image_sub = self.create_subscription(Image, self.image_topic, self.image_callback, qos_profile=image_qos)
-                self.log_debug(f"Subscribed to image topic: {self.image_topic}")
-            if self.lidar_sub is None:
-                qos = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT)
-                self.lidar_sub = self.create_subscription(LaserScan, '/scan_raw', self.lidar_callback, qos)
-                set_servo_position(self.joints_pub, 1, ((10, 200), (5, 500), (4, 90), (3, 150), (2, 820), (1, 500))) # Pitched robot arm up to see green beacon
-            self.mecanum_pub.publish(Twist())
         response.success = True
-        response.message = "enter"
+        self.set_callback = False
+        self.is_running = False
+        self.count = 0
+        self.color_picker = None
+        self.follower = None
+        self.image_queue = queue.Queue(2)
+        self.stop = False
+        self.threshold = 0.5
+        self.stop_threshold = 0.4
+        self.common = common.CommonNode(self)
+        self.color = 'green'
+
+        # reset lidar avoidance state
+        self.obs_last_act = 0
+        self.obs_timestamp = 0.0
+        self.avoid_active_until = 0.0
+
         return response
 
     def exit_srv_callback(self, request, response):
-        self.get_logger().info('\033[1;32m%s\033[0m' % "green_nav exit")
-        try:
-            if self.image_sub is not None:
-                self.destroy_subscription(self.image_sub)
-                self.image_sub = None
-            if self.lidar_sub is not None:
-                self.destroy_subscription(self.lidar_sub)
-                self.lidar_sub = None
-            self.log_debug("Exit: subscriptions destroyed and robot stopped.")
-        except Exception as e:
-            self.get_logger().error(str(e))
-        with self.lock:
-            self.is_running = False
-            self.pid = pid.PID(0.00, 0.001, 0.0)
-            self.follower = LineFollower([None, common.range_rgb[self.color]], self)
-            self.threshold = 0.5
-            self.mecanum_pub.publish(Twist())
         response.success = True
-        response.message = "exit"
+        self.set_callback = False
+        self.is_running = False
+        self.empty = 0
+        self.count = 0
+        self.color_picker = None
+        self.follower = None
+        self.heart.lose()
+        self.stop = False
+        self.threshold = 0.5
+        self.stop_threshold = 0.4
+        self.common = None
+        # stop robot
+        self.mecanum_pub.publish(Twist())
         return response
 
-    def set_running_srv_callback(self, request, response):
-        self.get_logger().info('\033[1;32m%s\033[0m' % "set_running")
-        with self.lock:
-            self.is_running = request.data
-            self.empty = 0
-            if self.is_running:
-                self.searching_for_green = True
-            if not self.is_running:
-                self.mecanum_pub.publish(Twist())
-            self.log_debug(f"set_running called: is_running={self.is_running}, stop={self.stop}, searching_for_green={self.searching_for_green}")
+    def set_srv_callback(self, request, response):
+        self.is_running = request.data
+        self.get_logger().info("is_running: {}".format(self.is_running))
         response.success = True
-        response.message = "set_running"
         return response
 
-    def set_threshold_srv_callback(self, request, response):
-        self.get_logger().info('\033[1;32m%s\033[0m' % "set threshold")
-        with self.lock:
-            self.threshold = request.data
-            self.log_debug(f"Threshold updated: {self.threshold}")
-            response.success = True
-            response.message = "set_threshold"
-            return response
+    # ---------- Image queue helper ----------
 
-    def lidar_callback(self, lidar_data):
-        if self.lidar_type != 'G4':
-            min_index = int(math.radians(MAX_SCAN_ANGLE / 2.0) / lidar_data.angle_increment)
-            max_index = int(math.radians(MAX_SCAN_ANGLE / 2.0) / lidar_data.angle_increment)
-            left_ranges = lidar_data.ranges[:max_index]
-            right_ranges = lidar_data.ranges[::-1][:max_index]
-        elif self.lidar_type == 'G4':
-            min_index = int(math.radians((360 - MAX_SCAN_ANGLE) / 2.0) / lidar_data.angle_increment)
-            max_index = int(math.radians(180) / lidar_data.angle_increment)
-            left_ranges = lidar_data.ranges[min_index:max_index][::-1]
-            right_ranges = lidar_data.ranges[::-1][min_index:max_index][::-1]
+    def image_queue_put(self, message):
+        if self.image_queue.full():
+            self.image_queue.get()
+        self.image_queue.put(message)
 
-        angle = self.scan_angle / 2
-        angle_index = int(angle / lidar_data.angle_increment + 0.50)
-        left_range, right_range = np.array(left_ranges[:angle_index]), np.array(right_ranges[:angle_index])
+    def image_process(self):
+        while True:
+            data = self.image_queue.get()
+            if data is None:
+                break
+            self.image_callback(data, from_queue=True)
 
-        left_nonzero = left_range.nonzero()
-        right_nonzero = right_range.nonzero()
-        left_nonan = np.isfinite(left_range[left_nonzero])
-        right_nonan = np.isfinite(right_range[right_nonzero])
-        min_dist_left_ = left_range[left_nonzero][left_nonan]
-        min_dist_right_ = right_range[right_nonzero][right_nonan]
-        if len(min_dist_left_) > 1 and len(min_dist_right_) > 1:
-            min_dist_left = min_dist_left_.min()
-            min_dist_right = min_dist_right_.min()
-            if min_dist_left < self.stop_threshold or min_dist_right < self.stop_threshold:
-                self.stop = True
-                self.log_debug(f"Lidar stop triggered: left={min_dist_left:.2f}, right={min_dist_right:.2f}, threshold={self.stop_threshold}")
-            else:
-                self.count += 1
-                if self.count > 5:
-                    self.count = 0
-                    self.stop = False
-                    self.log_debug(f"Lidar clear: left={min_dist_left:.2f}, right={min_dist_right:.2f}")
+    # ---------- Main image callback: line following + lidar override ----------
 
-    def image_callback(self, ros_image):
+    def image_callback(self, ros_image, from_queue=False):
         cv_image = self.bridge.imgmsg_to_cv2(ros_image, "rgb8")
         rgb_image = np.array(cv_image, dtype=np.uint8)
         self.image_height, self.image_width = rgb_image.shape[:2]
         result_image = np.copy(rgb_image)
-        self.last_image_ts = time.time()
+
         with self.lock:
             twist = Twist()
-            if self.follower is None:
-                self.follower = LineFollower([None, common.range_rgb[self.color]], self)
-            twist.linear.x = 0.15 # Speed variable
-            lab_map = self.lab_data.get('lab', {})
-            # Robust LAB selection with fallback to first available entry
-            lab_config = lab_map.get(self.lab_lookup_type, {}).get(self.color)
-            if lab_config is None and 'ascamera' in lab_map:
-                lab_config = lab_map['ascamera'].get(self.color)
-                self.log_debug(f"Falling back to LAB config key: ascamera")
-            if lab_config is None and lab_map:
-                first_key = next(iter(lab_map))
-                lab_config = lab_map[first_key].get(self.color)
-                self.log_debug(f"Falling back to LAB config key: {first_key}")
-            if lab_config is None:
-                self.get_logger().error("LAB config missing for selected color; cannot proceed.")
-                return
 
-            result_image, deflection_angle = self.follower(
-                rgb_image,
-                result_image,
-                self.threshold,
-                lab_config,
-                False,
-            )
-            if deflection_angle is not None:
-                self.searching_for_green = False
-            if deflection_angle is not None and self.is_running and not self.stop:
-                self.pid.update(deflection_angle)
-                if 'Acker' in self.machine_type:
-                    steering_angle = common.set_range(-self.pid.output, -math.radians(40), math.radians(40))
-                    if steering_angle != 0:
-                        R = 0.145 / math.tan(steering_angle)
-                        twist.angular.z = twist.linear.x / R
+            if self.use_color_picker:
+                # (Picker path kept for completeness, but default is named color "green")
+                if self.color_picker is not None:
+                    try:
+                        target_color, result_image = self.color_picker(rgb_image, result_image)
+                        if target_color is not None:
+                            self.color_picker = None
+                            self.follower = LineFollower(target_color, self)
+                            self.get_logger().info("target color: {}".format(target_color))
+                    except Exception as e:
+                        self.get_logger().error(str(e))
                 else:
-                    twist.angular.z = common.set_range(-self.pid.output, -1.0, 1.0)
-                self.mecanum_pub.publish(twist)
-            elif self.is_running and self.searching_for_green and not self.stop:
-                twist.linear.x = 0.0
-                twist.angular.z = self.search_angular_speed
-                self.mecanum_pub.publish(twist)
-            elif self.stop:
-                self.mecanum_pub.publish(Twist())
+                    twist.linear.x = 0.15
+                    if self.follower is not None:
+                        try:
+                            result_image, deflection_angle = self.follower(
+                                rgb_image, result_image, self.threshold
+                            )
+                            if deflection_angle is not None and self.is_running and not self.stop:
+                                self.pid.update(deflection_angle)
+                                if 'Acker' in self.machine_type:
+                                    steering_angle = common.set_range(
+                                        -self.pid.output, -math.radians(40), math.radians(40)
+                                    )
+                                    if steering_angle != 0:
+                                        R = 0.145 / math.tan(steering_angle)
+                                        twist.angular.z = twist.linear.x / R
+                                else:
+                                    twist.angular.z = common.set_range(-self.pid.output, -1.0, 1.0)
+                            elif self.stop:
+                                twist = Twist()
+                            else:
+                                self.pid.clear()
+                        except Exception as e:
+                            self.get_logger().error(str(e))
             else:
-                self.pid.clear()
+                # Named-color path: follow "green"
+                if self.color in common.range_rgb:
+                    twist.linear.x = 0.15
+                    self.follower = LineFollower([None, common.range_rgb[self.color]], self)
+                    result_image, deflection_angle = self.follower(
+                        rgb_image,
+                        result_image,
+                        self.threshold,
+                        self.lab_data['lab'][self.camera_type][self.color],
+                        False,
+                    )
+                    if deflection_angle is not None and self.is_running and not self.stop:
+                        self.pid.update(deflection_angle)
+                        if 'Acker' in self.machine_type:
+                            steering_angle = common.set_range(
+                                -self.pid.output, -math.radians(40), math.radians(40)
+                            )
+                            if steering_angle != 0:
+                                R = 0.145 / math.tan(steering_angle)
+                                twist.angular.z = twist.linear.x / R
+                        else:
+                            twist.angular.z = common.set_range(-self.pid.output, -1.0, 1.0)
+                    elif self.stop:
+                        twist = Twist()
+                    else:
+                        self.pid.clear()
 
-            self.frame_count += 1
-            if self.frame_count % self.log_interval == 0:
-                pid_output = getattr(self.pid, 'output', None)
-                pid_output_str = f"{pid_output:.3f}" if isinstance(pid_output, (int, float)) else "n/a"
-                self.log_debug(f"Frame {self.frame_count}: running={self.is_running}, stop={self.stop}, searching={self.searching_for_green}, deflection={deflection_angle}, pid_out={pid_output_str}")
-        # Show live camera view in an OpenCV window
-        try:
-            if not self.window_initialized:
-                cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-                self.window_initialized = True
-            cv2.imshow(self.window_name, cv2.cvtColor(result_image, cv2.COLOR_RGB2BGR))
-            cv2.waitKey(1)
-        except Exception as e:
-            self.get_logger().error(f"OpenCV display error: {e}")
+            # ---- LiDAR override: if avoidance window is active, replace twist ----
+            now = time.time()
+            if now < self.avoid_active_until:
+                twist = self.avoid_twist
 
-        self.result_publisher.publish(self.bridge.cv2_to_imgmsg(result_image, "rgb8"))
+            # Publish final command
+            if self.is_running:
+                self.mecanum_pub.publish(twist)
+
+        if not from_queue:
+            self.image_queue_put(ros_image)
+
+        # Debug window (unchanged from your original)
+        if 'display' in os.environ and os.environ['display'] == '1':
+            if os.environ['DEPTH_CAMERA_TYPE'] == 'ascamera':
+                if not self.set_callback:
+                    cv2.namedWindow("result", flags=cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+                    cv2.moveWindow("result", 480, 300)
+                    cv2.resizeWindow("result", 800, 480)
+                    self.common.add_mouse_callback(
+                        'result',
+                        self.image_width,
+                        self.image_height,
+                        self.set_target_color_server,
+                    )
+                    cv2.setMouseCallback("result", self.common.mouse_callback)
+                    self.set_callback = True
+            else:
+                if not self.set_callback:
+                    cv2.namedWindow("result", flags=cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+                    cv2.moveWindow("result", 480, 300)
+                    cv2.resizeWindow("result", 800, 480)
+                    self.set_callback = True
+                cv2.imshow("result", cv2.cvtColor(result_image, cv2.COLOR_RGB2BGR))
+                cv2.waitKey(1)
+
+    def destroy_node(self):
+        self.heart.lose()
+        super().destroy_node()
 
 
-def main():
-    node = GreenLineFollowingNode('green_nav')
-    rclpy.spin(node)
-    try:
-        if node.window_initialized:
-            cv2.destroyWindow(node.window_name)
-    except Exception:
-        pass
-    node.destroy_node()
-    rclpy.shutdown()
+def main(args=None):
+        rclpy.init(args=args)
+        node = LineFollowingWithLidarNode("line_following_with_lidar")
+        if 'display' in os.environ and os.environ['display'] == '1':
+            image_process_thread = threading.Thread(target=node.image_process, daemon=True)
+            image_process_thread.start()
+        rclpy.spin(node)
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
