@@ -20,7 +20,7 @@ from servo_controller_msgs.msg import ServosPosition
 from servo_controller.bus_servo_control import set_servo_position
 from cv_bridge import CvBridge
 from app.common import Heart
-from line_following import LineFollower, MAX_SCAN_ANGLE
+from green_nav_pkg.line_following import LineFollower, MAX_SCAN_ANGLE
 
 
 class GreenLineFollowingNode(Node):
