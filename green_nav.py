@@ -123,7 +123,8 @@ class GreenLineFollowingNode(Node):
         self.searching_for_green = True
         self.search_angular_speed = 0.4
         self.threshold = 0.5
-        self.stop_threshold = 0.4
+        # Stop only when obstacles are very close; configurable via parameter.
+        self.stop_threshold = float(self.declare_parameter('stop_threshold', 0.15).value)
         self.lock = threading.RLock()
         self.image_sub = None
         self.lidar_sub = None
@@ -164,6 +165,7 @@ class GreenLineFollowingNode(Node):
         Heart(self, self.name + '/heartbeat', 5, lambda _: self.exit_srv_callback(request=Trigger.Request(), response=Trigger.Response()))
         self.debug = bool(self.get_parameter('debug').value)
         self.log_debug(f"Debug logging enabled. DEPTH_CAMERA_TYPE={self.camera_type}, using LAB key={self.lab_lookup_type}, LIDAR_TYPE={self.lidar_type}, MACHINE_TYPE={self.machine_type}")
+        self.log_debug(f"Stop threshold set to {self.stop_threshold} meters (adjust with parameter stop_threshold)")
         self.get_logger().info('\033[1;32m%s\033[0m' % 'green_nav start')
 
     def log_debug(self, message: str):
