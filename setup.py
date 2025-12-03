@@ -15,7 +15,7 @@ setup(
     description='Green line following node and launches',
     entry_points={
         'console_scripts': [
-            'green_nav = green_nav:main'
+            'green_nav = green_nav_pkg.green_nav:main'
         ],
     },
 )
