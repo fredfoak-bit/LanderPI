@@ -202,7 +202,8 @@ class GreenLineFollowingNode(Node):
             self.empty = 0
             self.log_debug("Entering green_nav: reset PID and thresholds; creating subscriptions if needed.")
             if self.image_sub is None:
-                self.image_sub = self.create_subscription(Image, self.image_topic, self.image_callback, 1)
+                image_qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
+                self.image_sub = self.create_subscription(Image, self.image_topic, self.image_callback, qos_profile=image_qos)
                 self.log_debug(f"Subscribed to image topic: {self.image_topic}")
             if self.lidar_sub is None:
                 qos = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT)
