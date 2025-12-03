@@ -161,7 +161,8 @@ class GreenLineFollowingNode(Node):
 
     def _resolve_image_topic(self) -> str:
         if self.camera_type == 'aurora':
-            return '/aurora/camera_publisher/rgb0/image'
+            # On this platform Aurora images are published under ascamera namespace
+            return '/ascamera/camera_publisher/rgb0/image'
         if self.camera_type == 'usb_cam':
             return '/camera/image'
         return '/ascamera/camera_publisher/rgb0/image'
