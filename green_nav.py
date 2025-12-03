@@ -108,6 +108,8 @@ class GreenLineFollowingNode(Node):
 
         self.name = name
         self.color = "green"
+        self.frame_count = 0
+        self.log_interval = 15
         self.set_callback = False
         self.is_running = False
         self.follower = None
@@ -143,8 +145,14 @@ class GreenLineFollowingNode(Node):
         self.joints_pub = self.create_publisher(ServosPosition, 'servo_controller', 1)
 
         Heart(self, self.name + '/heartbeat', 5, lambda _: self.exit_srv_callback(request=Trigger.Request(), response=Trigger.Response()))
-        self.debug = self.get_parameter('debug').value
+        self.debug = bool(self.get_parameter('debug').value)
+        self.log_debug(f"Debug logging enabled. DEPTH_CAMERA_TYPE={self.camera_type}, LIDAR_TYPE={self.lidar_type}, MACHINE_TYPE={self.machine_type}")
         self.get_logger().info('\033[1;32m%s\033[0m' % 'green_nav start')
+
+    def log_debug(self, message: str):
+        if self.debug:
+            # rclpy logger already prints to terminal; keep messages concise.
+            self.get_logger().info(f"[debug] {message}")
 
     def pwm_controller(self, position_data):
         pwm_list = []
@@ -170,6 +178,7 @@ class GreenLineFollowingNode(Node):
             self.follower = LineFollower([None, common.range_rgb[self.color]], self)
             self.threshold = 0.5
             self.empty = 0
+            self.log_debug("Entering green_nav: reset PID and thresholds; creating subscriptions if needed.")
             if self.image_sub is None:
                 self.image_sub = self.create_subscription(Image, 'ascamera/camera_publisher/rgb0/image', self.image_callback, 1)
             if self.lidar_sub is None:
@@ -190,6 +199,7 @@ class GreenLineFollowingNode(Node):
             if self.lidar_sub is not None:
                 self.destroy_subscription(self.lidar_sub)
                 self.lidar_sub = None
+            self.log_debug("Exit: subscriptions destroyed and robot stopped.")
         except Exception as e:
             self.get_logger().error(str(e))
         with self.lock:
@@ -211,6 +221,7 @@ class GreenLineFollowingNode(Node):
                 self.searching_for_green = True
             if not self.is_running:
                 self.mecanum_pub.publish(Twist())
+            self.log_debug(f"set_running called: is_running={self.is_running}, stop={self.stop}, searching_for_green={self.searching_for_green}")
         response.success = True
         response.message = "set_running"
         return response
@@ -219,6 +230,7 @@ class GreenLineFollowingNode(Node):
         self.get_logger().info('\033[1;32m%s\033[0m' % "set threshold")
         with self.lock:
             self.threshold = request.data
+            self.log_debug(f"Threshold updated: {self.threshold}")
             response.success = True
             response.message = "set_threshold"
             return response
@@ -244,17 +256,19 @@ class GreenLineFollowingNode(Node):
         left_nonan = np.isfinite(left_range[left_nonzero])
         right_nonan = np.isfinite(right_range[right_nonzero])
         min_dist_left_ = left_range[left_nonzero][left_nonan]
-        min_dist_right_ = right_range[right_nonzero][right_nonan]
+            min_dist_right_ = right_range[right_nonzero][right_nonan]
         if len(min_dist_left_) > 1 and len(min_dist_right_) > 1:
             min_dist_left = min_dist_left_.min()
             min_dist_right = min_dist_right_.min()
             if min_dist_left < self.stop_threshold or min_dist_right < self.stop_threshold:
                 self.stop = True
+                self.log_debug(f"Lidar stop triggered: left={min_dist_left:.2f}, right={min_dist_right:.2f}, threshold={self.stop_threshold}")
             else:
                 self.count += 1
                 if self.count > 5:
                     self.count = 0
                     self.stop = False
+                    self.log_debug(f"Lidar clear: left={min_dist_left:.2f}, right={min_dist_right:.2f}")
 
     def image_callback(self, ros_image):
         cv_image = self.bridge.imgmsg_to_cv2(ros_image, "rgb8")
@@ -293,6 +307,12 @@ class GreenLineFollowingNode(Node):
                 self.mecanum_pub.publish(Twist())
             else:
                 self.pid.clear()
+
+            self.frame_count += 1
+            if self.frame_count % self.log_interval == 0:
+                pid_output = getattr(self.pid, 'output', None)
+                pid_output_str = f"{pid_output:.3f}" if isinstance(pid_output, (int, float)) else "n/a"
+                self.log_debug(f"Frame {self.frame_count}: running={self.is_running}, stop={self.stop}, searching={self.searching_for_green}, deflection={deflection_angle}, pid_out={pid_output_str}")
         # Show live camera view in an OpenCV window
         try:
             if not self.window_initialized:
