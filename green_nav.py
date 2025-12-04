@@ -142,6 +142,8 @@ class GreenLineFollowingNode(Node):
         self.count = 0
         self.stop = False
         self.searching_for_green = True
+        self.lost_frames = 0
+        self.lost_frame_limit = 5
         # Allow tuning how fast the robot spins while searching.
         self.search_angular_speed = float(self.declare_parameter('search_angular_speed', 0.2).value)
         # Whether to spin in place while searching (vs. slow turning).
@@ -377,6 +379,8 @@ class GreenLineFollowingNode(Node):
             )
             if deflection_angle is not None:
                 self.searching_for_green = False
+                self.lost_frames = 0
+                self.last_seen_green_ts = time.time()
             if deflection_angle is not None and self.is_running and not self.stop:
                 self.pid.update(deflection_angle)
                 if 'Acker' in self.machine_type:
@@ -394,6 +398,14 @@ class GreenLineFollowingNode(Node):
                     twist.linear.y = 0.0
                 twist.angular.z = self.search_angular_speed
                 self.mecanum_pub.publish(twist)
+            elif self.is_running and not self.stop:
+                # Lost the target: stop previous twist so we don't keep spinning blindly.
+                self.lost_frames += 1
+                if not self.searching_for_green and self.lost_frames >= self.lost_frame_limit:
+                    self.mecanum_pub.publish(Twist())  # stop motion
+                    self.searching_for_green = True
+                    self.lost_frames = 0
+                    self.log_debug("Lost green target: stopping motion and re-entering search mode")
             elif self.stop:
                 self.mecanum_pub.publish(Twist())
             else:
