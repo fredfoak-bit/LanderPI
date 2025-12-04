@@ -141,6 +141,22 @@ class GreenLineFollowingNode(Node):
         self.lab_lookup_type = self.camera_type if self.camera_type in lab_map else 'ascamera'
         self.last_image_ts = None
         default_image_topic = self._resolve_image_topic()
+        self.obstacle_avoidance_bias = 0.0
+        self.avoidance_activation_distance = float(self.declare_parameter('avoidance_activation_distance', 0.50).value)
+        self.avoidance_weight = float(self.declare_parameter('avoidance_weight', 0.8).value)
+        self.max_avoidance_turn = float(self.declare_parameter('max_avoidance_turn', 0.8).value)
+        self.avoidance_turn_in_place_gain = float(self.declare_parameter('avoidance_turn_in_place_gain', 2.5).value)
+        self.min_avoidance_turn_in_place = float(self.declare_parameter('min_avoidance_turn_in_place', math.radians(60)).value)
+        self.min_forward_after_probe = float(self.declare_parameter('min_forward_after_probe', 0.15).value)
+        self.base_forward_speed = 0.15
+        self.avoidance_engaged = False
+        self.last_avoidance_turn_sign = 1
+        self.avoidance_side_hysteresis = float(self.declare_parameter('avoidance_side_hysteresis', 0.05).value)
+        self.smoothed_avoidance_bias = 0.0
+        self.avoidance_turn_in_place = False
+        self.prev_avoidance_turn_in_place = False
+        self.advance_after_probe_until = None
+        self.min_front_distance = math.inf
         # Handle auto-declared params (automatically_declare_parameters_from_overrides=True) without double-declare crashes.
         image_topic_param = self.get_parameter('image_topic')
         if image_topic_param.type_ == Parameter.Type.NOT_SET or image_topic_param.value is None:
@@ -284,39 +300,84 @@ class GreenLineFollowingNode(Node):
             return response
 
     def lidar_callback(self, lidar_data):
-        if self.lidar_type != 'G4':
-            min_index = int(math.radians(MAX_SCAN_ANGLE / 2.0) / lidar_data.angle_increment)
-            max_index = int(math.radians(MAX_SCAN_ANGLE / 2.0) / lidar_data.angle_increment)
-            left_ranges = lidar_data.ranges[:max_index]
-            right_ranges = lidar_data.ranges[::-1][:max_index]
-        elif self.lidar_type == 'G4':
-            min_index = int(math.radians((360 - MAX_SCAN_ANGLE) / 2.0) / lidar_data.angle_increment)
-            max_index = int(math.radians(180) / lidar_data.angle_increment)
-            left_ranges = lidar_data.ranges[min_index:max_index][::-1]
-            right_ranges = lidar_data.ranges[::-1][min_index:max_index][::-1]
+        with self.lock:
+            previous_turning_in_place = self.avoidance_turn_in_place
+            if self.lidar_type != 'G4':
+                min_index = int(math.radians(MAX_SCAN_ANGLE / 2.0) / lidar_data.angle_increment)
+                max_index = int(math.radians(MAX_SCAN_ANGLE / 2.0) / lidar_data.angle_increment)
+                left_ranges = lidar_data.ranges[:max_index]
+                right_ranges = lidar_data.ranges[::-1][:max_index]
+            elif self.lidar_type == 'G4':
+                min_index = int(math.radians((360 - MAX_SCAN_ANGLE) / 2.0) / lidar_data.angle_increment)
+                max_index = int(math.radians(180) / lidar_data.angle_increment)
+                left_ranges = lidar_data.ranges[min_index:max_index][::-1]
+                right_ranges = lidar_data.ranges[::-1][min_index:max_index][::-1]
 
-        angle = self.scan_angle / 2
-        angle_index = int(angle / lidar_data.angle_increment + 0.50)
-        left_range, right_range = np.array(left_ranges[:angle_index]), np.array(right_ranges[:angle_index])
+            angle = self.scan_angle / 2
+            angle_index = int(angle / lidar_data.angle_increment + 0.50)
+            left_range, right_range = np.array(left_ranges[:angle_index]), np.array(right_ranges[:angle_index])
 
-        left_nonzero = left_range.nonzero()
-        right_nonzero = right_range.nonzero()
-        left_nonan = np.isfinite(left_range[left_nonzero])
-        right_nonan = np.isfinite(right_range[right_nonzero])
-        min_dist_left_ = left_range[left_nonzero][left_nonan]
-        min_dist_right_ = right_range[right_nonzero][right_nonan]
-        if len(min_dist_left_) > 1 and len(min_dist_right_) > 1:
-            min_dist_left = min_dist_left_.min()
-            min_dist_right = min_dist_right_.min()
-            if min_dist_left < self.stop_threshold or min_dist_right < self.stop_threshold:
-                self.stop = True
-                self.log_debug(f"Lidar stop triggered: left={min_dist_left:.2f}, right={min_dist_right:.2f}, threshold={self.stop_threshold}")
-            else:
-                self.count += 1
-                if self.count > 5:
-                    self.count = 0
-                    self.stop = False
-                    self.log_debug(f"Lidar clear: left={min_dist_left:.2f}, right={min_dist_right:.2f}")
+            left_nonzero = left_range.nonzero()
+            right_nonzero = right_range.nonzero()
+            left_nonan = np.isfinite(left_range[left_nonzero])
+            right_nonan = np.isfinite(right_range[right_nonzero])
+            min_dist_left_ = left_range[left_nonzero][left_nonan]
+            min_dist_right_ = right_range[right_nonzero][right_nonan]
+
+            # Obstacle avoidance bias: steer toward the side with more free space when something is between us and the target.
+            self.obstacle_avoidance_bias = 0.0
+            self.avoidance_engaged = False
+            self.avoidance_turn_in_place = False
+            self.min_front_distance = math.inf
+            if len(min_dist_left_) > 0 and len(min_dist_right_) > 0:
+                left_window = left_range[left_nonzero][left_nonan]
+                right_window = right_range[right_nonzero][right_nonan]
+                left_avg = float(np.median(left_window)) if len(left_window) > 0 else math.inf
+                right_avg = float(np.median(right_window)) if len(right_window) > 0 else math.inf
+                min_front = min(left_avg, right_avg)
+                self.min_front_distance = min_front
+                if math.isfinite(min_front) and min_front < self.avoidance_activation_distance:
+                    self.avoidance_engaged = True
+                    diff = (right_avg - left_avg)  # negative means obstacle is closer on the right
+                    if abs(diff) > self.avoidance_side_hysteresis:
+                        self.last_avoidance_turn_sign = 1 if diff > 0 else -1
+                    # Keep turning the same way inside the hysteresis band to avoid oscillation.
+                    biased_diff = diff if abs(diff) > self.avoidance_side_hysteresis else self.last_avoidance_turn_sign * self.avoidance_side_hysteresis
+                    normalized = biased_diff / max(self.avoidance_activation_distance, 1e-3)
+                    normalized = common.set_range(normalized, -1.0, 1.0)
+                    raw_bias = common.set_range(normalized, -self.max_avoidance_turn, self.max_avoidance_turn)
+                    # Smooth bias to reduce fish-tailing.
+                    self.obstacle_avoidance_bias = 0.5 * self.smoothed_avoidance_bias + 0.5 * raw_bias
+                    self.smoothed_avoidance_bias = self.obstacle_avoidance_bias
+                    if min_front < self.avoidance_activation_distance * 0.8:
+                        self.avoidance_turn_in_place = True
+                    self.log_debug(f"Obstacle avoidance engaged: left={left_avg:.2f}, right={right_avg:.2f}, diff={diff:.2f}, bias={self.obstacle_avoidance_bias:.2f}, min_front={min_front:.2f}, activation={self.avoidance_activation_distance}, hysteresis={self.avoidance_side_hysteresis}, turn_in_place={self.avoidance_turn_in_place}")
+                elif math.isfinite(min_front):
+                    # Decay smoothed bias when not engaged.
+                    self.smoothed_avoidance_bias *= 0.5
+                    self.log_debug(f"Obstacle ahead but outside activation: left={left_avg:.2f}, right={right_avg:.2f}, activation={self.avoidance_activation_distance}")
+
+            if self.avoidance_turn_in_place:
+                # Clear any pending forward-advance window while still probing.
+                self.advance_after_probe_until = None
+            elif previous_turning_in_place and not self.avoidance_turn_in_place:
+                duration = max(self.min_forward_after_probe / max(self.base_forward_speed, 1e-3), 0.2)
+                self.advance_after_probe_until = time.time() + duration
+                self.log_debug(f"Finished turn-in-place; advancing for {duration:.2f}s to clear obstacle.")
+
+            # Stop handling after avoidance assessment so avoidance can engage first.
+            if len(min_dist_left_) > 1 and len(min_dist_right_) > 1:
+                min_dist_left = min_dist_left_.min()
+                min_dist_right = min_dist_right_.min()
+                if min_dist_left < self.stop_threshold or min_dist_right < self.stop_threshold:
+                    self.stop = True
+                    self.log_debug(f"Lidar stop triggered: left={min_dist_left:.2f}, right={min_dist_right:.2f}, threshold={self.stop_threshold}")
+                else:
+                    self.count += 1
+                    if self.count > 5:
+                        self.count = 0
+                        self.stop = False
+                        self.log_debug(f"Lidar clear: left={min_dist_left:.2f}, right={min_dist_right:.2f}")
 
     def image_callback(self, ros_image):
         cv_image = self.bridge.imgmsg_to_cv2(ros_image, "rgb8")
@@ -328,7 +389,23 @@ class GreenLineFollowingNode(Node):
             twist = Twist()
             if self.follower is None:
                 self.follower = LineFollower([None, common.range_rgb[self.color]], self)
-            twist.linear.x = 0.15 # Speed variable
+            base_speed = self.base_forward_speed  # Speed variable
+            twist.linear.x = base_speed
+            avoid_correction = self.avoidance_weight * self.obstacle_avoidance_bias
+            if self.avoidance_engaged:
+                dist_scale = common.set_range(
+                    (self.min_front_distance if math.isfinite(self.min_front_distance) else self.avoidance_activation_distance)
+                    / max(self.avoidance_activation_distance, 1e-3),
+                    0.1,
+                    1.0,
+                )
+                twist.linear.x = base_speed * dist_scale
+                if self.avoidance_turn_in_place:
+                    twist.linear.x = 0.0
+            elif abs(avoid_correction) > 1e-3:
+                twist.linear.x *= 0.6  # slow down while maneuvering around an obstacle
+            if self.advance_after_probe_until and time.time() < self.advance_after_probe_until and not self.stop:
+                twist.linear.x = max(twist.linear.x, base_speed)
             lab_map = self.lab_data.get('lab', {})
             # Robust LAB selection with fallback to first available entry
             lab_config = lab_map.get(self.lab_lookup_type, {}).get(self.color)
@@ -354,20 +431,35 @@ class GreenLineFollowingNode(Node):
                 self.last_seen_green_ts = time.time()
             if deflection_angle is not None and self.is_running and not self.stop:
                 self.pid.update(deflection_angle)
+                pid_scale = 1.0
+                if self.avoidance_engaged:
+                    pid_scale = 0.4 if self.avoidance_turn_in_place else 0.7
                 if 'Acker' in self.machine_type:
                     steering_angle = common.set_range(-self.pid.output, -math.radians(40), math.radians(40))
                     if steering_angle != 0:
                         R = 0.145 / math.tan(steering_angle)
-                        twist.angular.z = self.turn_scale * (twist.linear.x / R)
+                        twist.angular.z = self.turn_scale * (twist.linear.x / R) * pid_scale
                 else:
-                    twist.angular.z = self.turn_scale * common.set_range(-self.pid.output, -1.0, 1.0)
+                    twist.angular.z = self.turn_scale * common.set_range(-self.pid.output, -1.0, 1.0) * pid_scale
+                twist.angular.z += common.set_range(avoid_correction, -self.max_avoidance_turn, self.max_avoidance_turn)
+                if self.avoidance_turn_in_place:
+                    twist.linear.x = 0.0
+                    turn_rate = self.max_avoidance_turn * self.avoidance_turn_in_place_gain
+                    turn_rate = max(turn_rate, self.min_avoidance_turn_in_place)
+                    twist.angular.z = turn_rate * self.last_avoidance_turn_sign
+                    self.log_debug(f"Turning in place to avoid obstacle; angular={twist.angular.z:.2f}, front={self.min_front_distance:.2f}")
                 self.mecanum_pub.publish(twist)
             elif self.is_running and self.searching_for_green and not self.stop:
                 # Force spin-in-place while searching so the robot doesn't creep forward.
                 if self.search_spin_in_place:
                     twist.linear.x = 0.0
                     twist.linear.y = 0.0
-                twist.angular.z = self.search_angular_speed
+                twist.angular.z = self.search_angular_speed + common.set_range(avoid_correction, -self.max_avoidance_turn, self.max_avoidance_turn)
+                if self.avoidance_turn_in_place:
+                    turn_rate = self.max_avoidance_turn * self.avoidance_turn_in_place_gain
+                    turn_rate = max(turn_rate, self.min_avoidance_turn_in_place)
+                    twist.angular.z = turn_rate * self.last_avoidance_turn_sign
+                    self.log_debug(f"Searching turn-in-place to probe obstacle clearance; angular={twist.angular.z:.2f}, front={self.min_front_distance:.2f}")
                 self.mecanum_pub.publish(twist)
             elif self.is_running and not self.stop:
                 # Lost the target: stop previous twist so we don't keep spinning blindly.
