@@ -137,7 +137,7 @@ class GreenLineFollowingNode(Node):
         self.is_running = False
         self.follower = None
         self.scan_angle = math.radians(45)
-        self.pid = pid.PID(0.030, 0.003, 0.0)
+        self.pid = pid.PID(0.020, 0.003, 0.0)
         self.empty = 0
         self.count = 0
         self.stop = False
