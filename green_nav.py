@@ -20,7 +20,7 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 from ros_robot_controller_msgs.msg import SetPWMServoState, PWMServoState
 from servo_controller_msgs.msg import ServosPosition
 from servo_controller.bus_servo_control import set_servo_position
-from xf_mic_asr_offline import voice_play
+from speech import speech
 from cv_bridge import CvBridge
 from app.common import Heart
 
@@ -119,6 +119,10 @@ class GreenLineFollowingNode(Node):
         self.lost_frames = 0
         self.lost_frame_limit = 5
         self.language = os.environ.get('ASR_LANGUAGE', 'Chinese')
+        # Keep green_nav audio alongside this file unless VOICE_FEEDBACK_PATH is set.
+        self.voice_base = os.environ.get('VOICE_FEEDBACK_PATH') or os.path.join(os.path.dirname(__file__), 'feedback_voice')
+        os.environ.setdefault('VOICE_FEEDBACK_PATH', self.voice_base)
+        self.voice_enabled = bool(self.declare_parameter('voice_feedback', True).value)
         self.announced_search = False
         self.announced_acquired = False
         self.announced_avoidance = False
@@ -197,9 +201,23 @@ class GreenLineFollowingNode(Node):
             # rclpy logger already prints to terminal; keep messages concise.
             self.get_logger().info(f"[debug] {message}")
 
-    def _play_voice(self, name: str):
+    def _voice_path(self, name: str) -> str:
+        """Resolve voice file path, allowing custom extensions (e.g., .mp3)."""
+        base = self.voice_base
+        filename = name if os.path.splitext(os.path.basename(name))[1] else name + '.wav'
+        if os.path.isabs(filename):
+            return filename
+        if self.language.lower().startswith('english'):
+            return os.path.join(base, 'english', filename)
+        return os.path.join(base, filename)
+
+    def _play_voice(self, name: str, volume: int = 80):
+        """Lightweight inlined audio playback so we do not depend on voice_play."""
+        if not self.voice_enabled:
+            return
         try:
-            voice_play.play(name, language=self.language)
+            speech.set_volume(volume)
+            speech.play_audio(self._voice_path(name))
         except Exception as e:
             self.get_logger().error(f"Voice playback failed for {name}: {e}")
 
@@ -458,7 +476,7 @@ class GreenLineFollowingNode(Node):
                 self.announced_search = False
 
             if avoidance_now and not self.announced_avoidance:
-                self._play_voice('warnning')
+                self._play_voice('warning.mp3')
                 self.announced_avoidance = True
             elif not avoidance_now:
                 self.announced_avoidance = False
