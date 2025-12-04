@@ -1,5 +1,8 @@
 Useful commands
 
+// Launch required topics
+ros2 launch green_nav_pkg green_nav_with_sensors.launch.py 
+
 // Launch green_nav node with debug features
 ros2 run green_nav_pkg green_nav --ros-args -p debug:=true 
 
