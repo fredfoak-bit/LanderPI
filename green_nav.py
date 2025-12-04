@@ -35,15 +35,36 @@ class LineFollower:
         self.target_lab, self.target_rgb = color
         self.depth_camera_type = os.environ['DEPTH_CAMERA_TYPE']
         if self.depth_camera_type == 'ascamera':
-            self.rois = ((0.9, 0.95, 0, 1, 0.7), (0.8, 0.85, 0, 1, 0.2), (0.7, 0.75, 0, 1, 0.1))
+            self.rois = (
+                (0.9, 0.95, 0, 1, 0.7),
+                (0.8, 0.85, 0, 1, 0.2),
+                (0.7, 0.75, 0, 1, 0.1),
+                (0.55, 0.60, 0, 1, 0.05),  # higher band to catch distant targets
+            )
         elif self.depth_camera_type == 'aurora':  # Aurora camera defaults
-            self.rois = ((0.81, 0.83, 0, 1, 0.7), (0.69, 0.71, 0, 1, 0.2), (0.57, 0.59, 0, 1, 0.1))
+            self.rois = (
+                (0.81, 0.83, 0, 1, 0.7),
+                (0.69, 0.71, 0, 1, 0.2),
+                (0.57, 0.59, 0, 1, 0.1),
+                (0.45, 0.50, 0, 1, 0.05),
+            )
         elif self.depth_camera_type == 'usb_cam':
-            self.rois = ((0.79, 0.81, 0, 1, 0.7), (0.67, 0.69, 0, 1, 0.2), (0.55, 0.57, 0, 1, 0.1))
+            self.rois = (
+                (0.79, 0.81, 0, 1, 0.7),
+                (0.67, 0.69, 0, 1, 0.2),
+                (0.55, 0.57, 0, 1, 0.1),
+                (0.42, 0.47, 0, 1, 0.05),
+            )
         else:
-            self.rois = ((0.8, 0.85, 0, 1, 0.7), (0.7, 0.75, 0, 1, 0.2), (0.6, 0.65, 0, 1, 0.1))
+            self.rois = (
+                (0.8, 0.85, 0, 1, 0.7),
+                (0.7, 0.75, 0, 1, 0.2),
+                (0.6, 0.65, 0, 1, 0.1),
+                (0.45, 0.50, 0, 1, 0.05),
+            )
 
-        self.weight_sum = 1.0
+        self.weight_sum = sum(roi[-1] for roi in self.rois) or 1.0
+        self.min_contour_area = 15  
 
     @staticmethod
     def get_area_max_contour(contours, threshold=100):
@@ -80,7 +101,7 @@ class LineFollower:
             eroded = cv2.erode(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
             dilated = cv2.dilate(eroded, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
             contours = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_L1)[-2]
-            max_contour_area = self.get_area_max_contour(contours, 30)
+            max_contour_area = self.get_area_max_contour(contours, self.min_contour_area)
             if max_contour_area is not None:
                 rect = cv2.minAreaRect(max_contour_area[0])
                 box = np.intp(cv2.boxPoints(rect))
