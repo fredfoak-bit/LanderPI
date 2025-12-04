@@ -202,13 +202,11 @@ class GreenLineFollowingNode(Node):
             self.get_logger().info(f"[debug] {message}")
 
     def _voice_path(self, name: str) -> str:
-        """Resolve voice file path, allowing custom extensions (e.g., .mp3)."""
+        """Resolve voice file path in the single feedback_voice directory."""
         base = self.voice_base
         filename = name if os.path.splitext(os.path.basename(name))[1] else name + '.wav'
         if os.path.isabs(filename):
             return filename
-        if self.language.lower().startswith('english'):
-            return os.path.join(base, 'english', filename)
         return os.path.join(base, filename)
 
     def _play_voice(self, name: str, volume: int = 80):
@@ -476,7 +474,7 @@ class GreenLineFollowingNode(Node):
                 self.announced_search = False
 
             if avoidance_now and not self.announced_avoidance:
-                self._play_voice('warning.mp3')
+                self._play_voice('warning')
                 self.announced_avoidance = True
             elif not avoidance_now:
                 self.announced_avoidance = False
