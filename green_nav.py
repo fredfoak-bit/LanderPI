@@ -149,6 +149,8 @@ class GreenLineFollowingNode(Node):
         self.threshold = 0.5
         # Stop only when obstacles are very close; configurable via parameter.
         self.stop_threshold = float(self.declare_parameter('stop_threshold', 0.15).value)
+        # Scale turn rate toward the target for smoother steering.
+        self.turn_scale = float(self.declare_parameter('turn_scale', 0.5).value)
         self.lock = threading.RLock()
         self.image_sub = None
         self.lidar_sub = None
@@ -191,6 +193,7 @@ class GreenLineFollowingNode(Node):
         self.debug = bool(self.get_parameter('debug').value)
         self.log_debug(f"Debug logging enabled. DEPTH_CAMERA_TYPE={self.camera_type}, using LAB key={self.lab_lookup_type}, LIDAR_TYPE={self.lidar_type}, MACHINE_TYPE={self.machine_type}")
         self.log_debug(f"Stop threshold set to {self.stop_threshold} meters (adjust with parameter stop_threshold)")
+        self.log_debug(f"Turn scale set to {self.turn_scale} (adjust with parameter turn_scale)")
         self.get_logger().info('\033[1;32m%s\033[0m' % 'green_nav start')
 
     def log_debug(self, message: str):
@@ -380,9 +383,9 @@ class GreenLineFollowingNode(Node):
                     steering_angle = common.set_range(-self.pid.output, -math.radians(40), math.radians(40))
                     if steering_angle != 0:
                         R = 0.145 / math.tan(steering_angle)
-                        twist.angular.z = twist.linear.x / R
+                        twist.angular.z = self.turn_scale * (twist.linear.x / R)
                 else:
-                    twist.angular.z = common.set_range(-self.pid.output, -1.0, 1.0)
+                    twist.angular.z = self.turn_scale * common.set_range(-self.pid.output, -1.0, 1.0)
                 self.mecanum_pub.publish(twist)
             elif self.is_running and self.searching_for_green and not self.stop:
                 # Force spin-in-place while searching so the robot doesn't creep forward.
