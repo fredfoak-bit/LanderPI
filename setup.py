@@ -15,7 +15,8 @@ setup(
     description='Green line following node and launches',
     entry_points={
         'console_scripts': [
-            'green_nav = green_nav_pkg.green_nav:main'
+            'green_nav = green_nav_pkg.green_nav:main',
+            'fist_back_node = green_nav_pkg.fist_back_node:main', # <--- ADDED for hand gesture recognition
         ],
     },
 )
