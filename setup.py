@@ -1,7 +1,7 @@
 from glob import glob
 from setuptools import setup
 
-package_name = 'green_nav_pkg'
+package_name = 'HRI_pkg'
 
 setup(
     name=package_name,
@@ -12,11 +12,10 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
     ],
-    description='Green line following node and launches',
+    description='Hand gesture recognition and response',
     entry_points={
         'console_scripts': [
-            'green_nav = green_nav_pkg.green_nav:main',
-            'fist_back_node = green_nav_pkg.fist_back_node:main', # <--- ADDED for hand gesture recognition
+            'fist_back_node = HRI_pkg.HRI:main', #for hand gesture recognition
         ],
     },
 )

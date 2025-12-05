@@ -11,7 +11,7 @@ import mediapipe as mp
 from rclpy.node import Node
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Twist
-from ros_robot_controller_msgs.msg import BuzzerState
+from std_msgs.msg import String  # CHANGED: Import String for TTS
 
 # MediaPipe constants
 mp_hands = mp.solutions.hands
@@ -43,29 +43,28 @@ class FistBackNode(Node):
         self.drawing = mp.solutions.drawing_utils
         
         # Publishers
-        self.mecanum_pub = self.create_publisher(Twist, '/controller/cmd_vel', 1) # Chassis control
-        self.buzzer_pub = self.create_publisher(BuzzerState, '/ros_robot_controller/set_buzzer', 1) # Warning sign
+        self.mecanum_pub = self.create_publisher(Twist, '/controller/cmd_vel', 1) 
+        
+        # CHANGED: Publisher for TTS instead of Buzzer
+        # The tts_node listens to '~/tts_text', so we publish to '/tts_node/tts_text'
+        self.tts_pub = self.create_publisher(String, '/tts_node/tts_text', 1) 
         
         # Camera Subscription
         self.camera_topic = '/ascamera/camera_publisher/rgb0/image'
         self.bridge = CvBridge()
         self.image_queue = queue.Queue(maxsize=2)
-        self.create_subscription(self.get_msg_type_from_string('sensor_msgs/msg/Image'), self.camera_topic, self.image_callback, 1)
+        # Dynamic import to avoid hardcoding issues if environments differ
+        from sensor_msgs.msg import Image
+        self.create_subscription(Image, self.camera_topic, self.image_callback, 1)
 
         self.running = True
         self.is_backing_up = False # Lock to prevent continuous triggering
         
         # Start processing thread
         threading.Thread(target=self.image_proc, daemon=True).start()
-        self.get_logger().info('Fist Detection Node Started. Show a FIST to move back!')
-
-    def get_msg_type_from_string(self, type_str):
-        # dynamic import to avoid hardcoding issues if environments differ
-        from sensor_msgs.msg import Image
-        return Image
+        self.get_logger().info('Fist Detection Node Started. Show a FIST to say DANGER and move back!')
 
     def image_callback(self, ros_image):
-        # Convert ROS image to OpenCV image
         try:
             cv_image = self.bridge.imgmsg_to_cv2(ros_image, "rgb8")
             rgb_image = np.array(cv_image, dtype=np.uint8)
@@ -82,14 +81,11 @@ class FistBackNode(Node):
         """
         h, w, _ = shape
         
-        # Helper to get pixel coords
         def get_coord(idx):
             return np.array([landmarks[idx].x * w, landmarks[idx].y * h])
 
         wrist = get_coord(WRIST)
         
-        # Check if fingers are folded (Tip closer to wrist than MCP)
-        # Using a simple distance threshold or comparison could work
         fingers_indices = [
             (INDEX_FINGER_TIP, INDEX_FINGER_MCP),
             (MIDDLE_FINGER_TIP, MIDDLE_FINGER_MCP),
@@ -102,11 +98,8 @@ class FistBackNode(Node):
             tip = get_coord(tip_idx)
             mcp = get_coord(mcp_idx)
             
-            dist_tip_wrist = np.linalg.norm(tip - wrist)
-            dist_mcp_wrist = np.linalg.norm(mcp - wrist)
-            
             # If tip is closer to wrist than the knuckle (MCP), it's folded
-            if dist_tip_wrist < dist_mcp_wrist * 1.2: # 1.2 is a tolerance factor
+            if np.linalg.norm(tip - wrist) < np.linalg.norm(mcp - wrist) * 1.2: 
                 folded_count += 1
                 
         # If at least 3 fingers (excluding thumb) are folded, consider it a fist
@@ -117,22 +110,19 @@ class FistBackNode(Node):
             return
 
         self.is_backing_up = True
-        self.get_logger().warn("FIST DETECTED! Moving back...")
+        self.get_logger().warn("FIST DETECTED! Saying Danger and Moving back...")
 
-        # 1. Sound Buzzer
-        buzzer_msg = BuzzerState()
-        buzzer_msg.freq = 2000
-        buzzer_msg.on_time = 0.5
-        buzzer_msg.off_time = 0.1
-        buzzer_msg.repeat = 2
-        self.buzzer_pub.publish(buzzer_msg)
+        # 1. CHANGED: Speak "Danger"
+        tts_msg = String()
+        tts_msg.data = "danger"
+        self.tts_pub.publish(tts_msg)
 
-        # 2. Move Backwards
+        # 2. Move Backwards (Kept as requested)
         twist = Twist()
         twist.linear.x = -0.2 # Move back at 0.2 m/s
         self.mecanum_pub.publish(twist)
         
-        # Move for a short duration (e.g., 0.5 seconds -> approx 10cm)
+        # Move for a short duration
         time.sleep(0.5) 
         
         # 3. Stop
@@ -158,15 +148,12 @@ class FistBackNode(Node):
             
             if results.multi_hand_landmarks:
                 for hand_landmarks in results.multi_hand_landmarks:
-                    # Draw landmarks
                     self.drawing.draw_landmarks(
                         bgr_image, hand_landmarks, mp_hands.HAND_CONNECTIONS)
                     
-                    # Check for Fist
                     if self.is_fist(hand_landmarks.landmark, image_flip.shape):
-                        # Run action in a separate thread so visual loop doesn't freeze
                         threading.Thread(target=self.trigger_warning_and_move).start()
-                        cv2.putText(bgr_image, "FIST: BACKING UP", (50, 50), 
+                        cv2.putText(bgr_image, "FIST: DANGER!", (50, 50), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
             
             cv2.imshow(self.name, bgr_image)
@@ -174,7 +161,7 @@ class FistBackNode(Node):
             if key == 27: # ESC
                 self.running = False
 
-        self.mecanum_pub.publish(Twist()) # Stop on exit
+        self.mecanum_pub.publish(Twist()) 
         rclpy.shutdown()
 
 def main():
