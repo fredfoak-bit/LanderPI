@@ -5,6 +5,7 @@ import time
 import rclpy
 import queue
 import threading
+import sys
 import numpy as np
 import mediapipe as mp
 import os
@@ -14,9 +15,9 @@ from geometry_msgs.msg import Twist
 from servo_controller_msgs.msg import ServosPosition
 from servo_controller.bus_servo_control import set_servo_position
 
-# --- IMPORTS FOR DIRECT SPEECH ---
+# --- IMPORTS FOR AUDIO ---
 from speech import speech
-from large_models.config import * # ---------------------------------
+# -------------------------
 
 # MediaPipe constants
 mp_hands = mp.solutions.hands
@@ -38,19 +39,14 @@ class FistStopNode(Node):
         super().__init__(name)
         self.name = name
         
-        # 1. Initialize Speech
-        self.language = os.environ.get("ASR_LANGUAGE", "English")
-        try:
-            if self.language == 'Chinese':
-                self.tts_engine = speech.RealTimeTTS(log=self.get_logger())
-            else:
-                self.tts_engine = speech.RealTimeOpenAITTS(log=self.get_logger())
-            self.get_logger().info("Speech Engine Ready!")
-        except Exception as e:
-            self.get_logger().error(f"Failed to init speech engine: {e}")
-            self.tts_engine = None
+        # Audio Setup
+        self.voice_base = os.environ.get('VOICE_FEEDBACK_PATH') or os.path.join(os.path.dirname(__file__), 'feedback_voice')
+        os.environ.setdefault('VOICE_FEEDBACK_PATH', self.voice_base)
+        self.voice_enabled = True
+        self.voice_cooldown = 1.0
+        self.last_voice_played = {}
 
-        # 2. Initialize Hand Detector
+        # Hand Detector
         self.hand_detector = mp.solutions.hands.Hands(
             static_image_mode=False,
             max_num_hands=1,
@@ -59,29 +55,53 @@ class FistStopNode(Node):
         )
         self.drawing = mp.solutions.drawing_utils
         
-        # 3. Publishers
+        # Publishers
         self.mecanum_pub = self.create_publisher(Twist, '/controller/cmd_vel', 1) 
-        # Correct Publisher for Servos
         self.joints_pub = self.create_publisher(ServosPosition, '/servo_controller', 1)
 
-        # 4. Camera Subscription
+        # Camera Subscription
         self.camera_topic = '/ascamera/camera_publisher/rgb0/image'
         self.bridge = CvBridge()
         self.image_queue = queue.Queue(maxsize=2)
         from sensor_msgs.msg import Image
         self.create_subscription(Image, self.camera_topic, self.image_callback, 1)
 
-        # 5. State Flags
+        # State Flags
         self.running = True
-        self.fist_detected = False # Shared flag between threads
+        self.fist_detected = False 
+        self.wave_detected = False # NEW: Flag for wave
+        self.check_attempts = 0 
         
-        # 6. Start Threads
-        # Thread 1: Process Images (Fast)
+        # Start Threads
         threading.Thread(target=self.image_proc, daemon=True).start()
-        # Thread 2: Control Robot Behavior (Slow Sequence)
         threading.Thread(target=self.control_loop, daemon=True).start()
         
-        self.get_logger().info('Fist Stop Node Started.')
+        self.get_logger().info('Fist/Wave Node Started. Detects "Fist" (Danger) or "Wave" (Survivor).')
+
+    def _voice_path(self, name: str) -> str:
+        base = self.voice_base
+        filename = name if os.path.splitext(os.path.basename(name))[1] else name + '.wav'
+        if os.path.isabs(filename):
+            return filename
+        return os.path.join(base, filename)
+
+    def _play_voice(self, name: str, volume: int = 100):
+        if not self.voice_enabled:
+            return
+        path = self._voice_path(name)
+        now = time.time()
+        last_played = self.last_voice_played.get(path)
+        if last_played is not None and (now - last_played) < self.voice_cooldown:
+            return
+        try:
+            if os.path.exists(path):
+                speech.set_volume(volume)
+                speech.play_audio(path)
+                self.last_voice_played[path] = now
+            else:
+                self.get_logger().warn(f"Audio file not found: {path}")
+        except Exception as e:
+            self.get_logger().error(f"Voice playback failed for {name}: {e}")
 
     def image_callback(self, ros_image):
         try:
@@ -94,6 +114,7 @@ class FistStopNode(Node):
             self.get_logger().error(f"Image callback error: {e}")
 
     def is_fist(self, landmarks, shape):
+        """Detects if 3 or more fingers are folded (Fist)"""
         h, w, _ = shape
         def get_coord(idx):
             return np.array([landmarks[idx].x * w, landmarks[idx].y * h])
@@ -110,83 +131,152 @@ class FistStopNode(Node):
         for tip_idx, mcp_idx in fingers_indices:
             tip = get_coord(tip_idx)
             mcp = get_coord(mcp_idx)
+            # Tip closer to wrist than knuckle = Folded
             if np.linalg.norm(tip - wrist) < np.linalg.norm(mcp - wrist) * 1.2: 
                 folded_count += 1
         return folded_count >= 3
 
-    def move_camera(self, pitch_angle):
-        """
-        pitch_angle: 500 is roughly horizon, 750 is looking down, 300 is looking up
-        """
-        # Servo 1: Pan (500 center), Servo 2: Tilt (pitch_angle)
-        # Duration: 1.0 seconds
-        set_servo_position(self.joints_pub, 1.0, ((1, 500), (2, pitch_angle)))
-        time.sleep(1.0) # Wait for servo to move
+    def is_wave(self, landmarks, shape):
+        """Detects if 4 or more fingers are extended (Open Palm / Wave)"""
+        h, w, _ = shape
+        def get_coord(idx):
+            return np.array([landmarks[idx].x * w, landmarks[idx].y * h])
+
+        wrist = get_coord(WRIST)
+        fingers_indices = [
+            (INDEX_FINGER_TIP, INDEX_FINGER_MCP),
+            (MIDDLE_FINGER_TIP, MIDDLE_FINGER_MCP),
+            (RING_FINGER_TIP, RING_FINGER_MCP),
+            (PINKY_TIP, PINKY_MCP),
+            (THUMB_TIP, mp_hands.HandLandmark.THUMB_CMC) # Added thumb for wave
+        ]
+        
+        extended_count = 0
+        for tip_idx, mcp_idx in fingers_indices:
+            tip = get_coord(tip_idx)
+            mcp = get_coord(mcp_idx)
+            # Tip further from wrist than knuckle = Extended
+            if np.linalg.norm(tip - wrist) > np.linalg.norm(mcp - wrist): 
+                extended_count += 1
+        return extended_count >= 4
+
+    def set_camera_posture(self, mode):
+        # 10=Clamp, 5=Wrist, 4=Elbow, 3=Shoulder, 2=Tilt, 1=Pan
+        if mode == 'drive':
+            positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 500))
+            set_servo_position(self.joints_pub, 1.0, positions)
+        elif mode == 'look_up':
+            positions = ((10, 200), (5, 500), (4, 90), (3, 350), (2, 780), (1, 500))
+            set_servo_position(self.joints_pub, 1.0, positions)
+        time.sleep(0.5)
 
     def stop_robot(self):
         twist = Twist()
         twist.linear.x = 0.0
-        self.mecanum_pub.publish(twist)
+        twist.angular.z = 0.0
+        for _ in range(5):
+            self.mecanum_pub.publish(twist)
+            time.sleep(0.05)
 
-    def move_forward(self, speed=0.2):
+    def move_forward(self):
         twist = Twist()
-        twist.linear.x = speed
+        twist.linear.x = 0.15 
         self.mecanum_pub.publish(twist)
+    
+    def rotate_once(self):
+        """Timeout rotation: Left (Positive Z)"""
+        self.get_logger().warn("Attempts limit reached. Rotating once (Left)...")
+        twist = Twist()
+        twist.angular.z = 1.5
+        self.mecanum_pub.publish(twist)
+        time.sleep(4.2) 
+        self.stop_robot()
 
-    def speak(self, text):
-        if self.tts_engine:
-            try:
-                self.tts_engine.tts(text, model=tts_model, voice=voice_model)
-            except Exception as e:
-                self.get_logger().error(f"Speech error: {e}")
+    def rotate_opposite(self):
+        """Survivor rotation: Right (Negative Z), Opposite to rotate_once"""
+        self.get_logger().warn("Survivor found. Rotating Opposite (Right)...")
+        positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 500))
+        set_servo_position(self.joints_pub, 1.0, positions)
+        twist = Twist()
+        twist.angular.z = -1.5 # Negative for opposite direction
+        self.mecanum_pub.publish(twist)
+        time.sleep(4.2) 
+        self.stop_robot()
+
+    def check_gestures(self, duration):
+        """
+        Polls for gestures. Returns 'fist', 'wave', or None.
+        """
+        start_time = time.time()
+        while time.time() - start_time < duration:
+            if self.fist_detected:
+                return 'fist'
+            if self.wave_detected:
+                return 'wave'
+            time.sleep(0.05)
+        return None
 
     def control_loop(self):
-        """
-        Main logic loop: Forward -> Stop -> Look Up -> Check Fist -> Repeat/Stop
-        """
-        # Initial wait for system to settle
-        time.sleep(2)
-        
-        # Reset Camera to look down/forward initially (750)
-        self.move_camera(750) 
+        time.sleep(2) 
         
         while self.running:
-            # 1. Move Forward
-            self.get_logger().info("Moving Forward...")
-            self.move_forward(0.2)
-            time.sleep(3.0) # Move for 3 seconds
+            #if self.check_attempts >= 3:
+            #    self.rotate_once()
+            #    self.stop_robot()
+            #    self.running = False
+            #    break
+
+            # 1. Prepare to Drive
+            #self.set_camera_posture('drive')
             
-            # 2. Stop Moving
-            self.get_logger().info("Stopping...")
-            self.stop_robot()
-            time.sleep(0.5) # Wait for complete stop
+            # 2. Move Forward
+            #self.get_logger().info(f"Moving Forward ({self.check_attempts + 1}/3)...")
+            #self.move_forward()
+            #time.sleep(3.0) 
             
-            # 3. Look Up
-            self.get_logger().info("Looking Up...")
-            self.move_camera(500) # 500 is higher than 750 (Horizon/Up)
+            # 3. Stop
+            #self.stop_robot()
             
-            # 4. Check for Fist (Wait a moment to detect)
-            time.sleep(1.0) # Give camera time to see
+            # 4. Look Up / Check
+            self.get_logger().info("Checking...")
+            self.set_camera_posture('look_up')
             
-            if self.fist_detected:
-                self.get_logger().warn("FIST SEEN! Stopping Permanently.")
-                self.speak("Danger")
-                self.stop_robot()
-                self.running = False # Break the loop
+            # 5. Monitor Gestures
+            self.get_logger().info("Scanning for Gestures (Fist/Wave)...")
+            result = self.check_gestures(2.0)
+            
+            if result == 'fist':
+                self.get_logger().warn("FIST SEEN! (Danger)")
+                self._play_voice('Danger') 
+                #self.stop_robot()
+                self.running = False
                 break
+            elif result == 'wave':
+                self.get_logger().warn("WAVE SEEN! (Survivor)")
+                self._play_voice('Survivor') # Make sure survivor.wav exists
+                positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 220))
+                set_servo_position(self.joints_pub, 1.0, positions)
+                time.sleep(0.5)
+                positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 780))
+                set_servo_position(self.joints_pub, 1.0, positions)
+                time.sleep(0.5)
+                positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 500))
+                set_servo_position(self.joints_pub, 1.0, positions)
+                self.running = False
+                break
+            
             else:
-                self.get_logger().info("No Fist. Continuing...")
-                # 5. Look Down/Reset
-                self.move_camera(750) # Look back down/forward
-                # Loop repeats
+                #self.get_logger().info("Nothing detected. Incrementing attempts.")
+                #self.check_attempts += 1
+                self.rotate_opposite()
+
                 
-        self.stop_robot()
+        #self.stop_robot()
+        self.get_logger().info("Exiting Program...")
         rclpy.shutdown()
+        sys.exit(0)
 
     def image_proc(self):
-        """
-        Fast loop for detection only
-        """
         while self.running:
             try:
                 image = self.image_queue.get(block=True, timeout=1)
@@ -197,7 +287,9 @@ class FistStopNode(Node):
             bgr_image = cv2.cvtColor(image_flip, cv2.COLOR_RGB2BGR)
             results = self.hand_detector.process(image_flip)
             
-            detected_now = False
+            # Reset local flags
+            fist_now = False
+            wave_now = False
             
             if results.multi_hand_landmarks:
                 for hand_landmarks in results.multi_hand_landmarks:
@@ -205,12 +297,16 @@ class FistStopNode(Node):
                         bgr_image, hand_landmarks, mp_hands.HAND_CONNECTIONS)
                     
                     if self.is_fist(hand_landmarks.landmark, image_flip.shape):
-                        detected_now = True
-                        cv2.putText(bgr_image, "FIST DETECTED", (50, 50), 
+                        fist_now = True
+                        cv2.putText(bgr_image, "FIST (DANGER)", (50, 50), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                    elif self.is_wave(hand_landmarks.landmark, image_flip.shape):
+                        wave_now = True
+                        cv2.putText(bgr_image, "WAVE (SURVIVOR)", (50, 50), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             
-            # Update shared flag
-            self.fist_detected = detected_now
+            self.fist_detected = fist_now
+            self.wave_detected = wave_now
             
             cv2.imshow(self.name, bgr_image)
             key = cv2.waitKey(1)
@@ -218,11 +314,12 @@ class FistStopNode(Node):
                 self.running = False
 
 def main():
-    # Use the same node name as your setup.py entry point
     node = FistStopNode('fist_back_node')
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
+        pass
+    except SystemExit:
         pass
     finally:
         node.destroy_node()
